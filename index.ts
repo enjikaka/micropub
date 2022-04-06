@@ -1,5 +1,4 @@
 import { http, fs } from './deps.ts';
-import lumeCiMain from 'https://deno.land/x/lume/ci.ts';
 
 const envPort = Deno.env.get('PORT');
 const port = envPort ? parseInt(envPort, 10) : 8080;
@@ -85,7 +84,7 @@ function encodeMdMetadata (metadata: Record<string, any>): string {
   const lines = ['---'];
 
   for (const [key, val] of Object.entries(metadata)) {
-    lines.push(`${key}: ${JSON.stringify(val)}`);
+    lines.push(`${key}: ${Array.isArray(val) ? JSON.stringify(val) : val}`);
   }
 
   lines.push('---');
@@ -162,8 +161,11 @@ async function micropubCreatePost(request: Request): Promise<Response> {
   const formData = await request.formData();
   const postContentHash = await checksum(formData.get('content')?.toString() ?? '');
   const timeHash = await checksum(Date.now() + '');
-  const postId = `${new Date().toISOString().split('T')[0]}-${postContentHash.substring(0, 3)}${timeHash.substring(0, 3)}`;
-  const metadata: Record<string, any> = {};
+  const dateString = new Date().toISOString().split('T')[0];
+  const postId = `${dateString}-${postContentHash.substring(0, 3)}${timeHash.substring(0, 3)}`;
+  const metadata: Record<string, any> = {
+    date: dateString
+  };
   const type = formData.get('h')?.toString() || 'entry';
 
   for (const [key, val] of formData.entries()) {
@@ -317,13 +319,29 @@ Deno.run({
   ]
 });
 
+function runLume () {
+  Deno.run({
+    cmd: [
+      "deno",
+      "run",
+      "--allow-run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-net",
+      "https://deno.land/x/lume@v1.7.2/ci.ts"
+    ]
+  });
+}
+
+runLume();
+
 async function handler (request: Request): Promise<Response>  {
   const url = new URL(request.url);
 
   if (url.pathname.includes('/micropub')) {
     const response = await micropubHandler(request);
 
-    lumeCiMain([]);
+    runLume();
 
     return response;
   }
