@@ -1,0 +1,18 @@
+<h1>micropub</h1>
+<p>A micropub server for Lume blogs.</p>
+<h2>Inner workings</h2>
+<h2>Create</h2>
+<p>Creating a post will render the output in the <code>h-${type}</code> folder as markdown files.</p>
+<p>A typical h-entry will therefore end up in the <code>h-entry/</code> folder.</p>
+<p>Images/photos in mulipart requests be sent to <code>/img</code>.</p>
+<h2>Delete</h2>
+<p>Deleting a post will edit the markdown metadata to <code>draft: true</code></p>
+<h2>Undelete</h2>
+<p>Undeleting a post will edit the markdown metadata to <code>draft: false</code></p>
+<h2>Todo</h2>
+<ul>
+<li>Add static server to <code>public/</code> folder.</li>
+<li>Support query and updates in micropub api</li>
+<li>Run Lume generation on changes</li>
+<li>Support JSON requests</li>
+</ul>

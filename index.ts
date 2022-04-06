@@ -1,13 +1,10 @@
 import { http, fs } from './deps.ts';
+import lumeCiMain from 'https://deno.land/x/lume/ci.ts';
 
 const envPort = Deno.env.get('PORT');
 const port = envPort ? parseInt(envPort, 10) : 8080;
 
 const textEncoder = new TextEncoder();
-
-const mimeToExt: Record<string, string> = {
-  'image/jpeg': 'jpg'
-}
 
 class HttpError extends Error {
   status: number;
@@ -15,7 +12,7 @@ class HttpError extends Error {
   constructor(status: number, message: string = '') {
     super();
 
-    this.message = status + '';
+    this.message = status + ': ' + message;
     this.status = status;
   }
 }
@@ -44,8 +41,10 @@ async function findAccessToken (request: Request): Promise<string> {
     }
   }
 
+  console.log({ accessTokenFromBody, accessTokenFromHeader });
+
   if (accessTokenFromBody && accessTokenFromHeader) {
-    throw new HttpError(400);
+    throw new HttpError(400, 'Access token not allowed in both header and body at the same time');
   }
 
   if (accessTokenFromBody && !accessTokenFromHeader) {
@@ -98,8 +97,9 @@ async function micropubUndeletePost(request: Request): Promise<Response> {
   const formData = await request.formData();
   const url = formData.get('url');
 
-  if (url) {
-    const path = `./${url.toString()}.md`;
+  if (url && typeof url === 'string') {
+    const { pathname } = new URL(url);
+    const path = `.${pathname}.md`;
 
     const text = await Deno.readTextFile(path);
     const metaData = decodeMdMetadata(text);
@@ -124,8 +124,9 @@ async function micropubDeletePost(request: Request): Promise<Response> {
   const formData = await request.formData();
   const url = formData.get('url');
 
-  if (url) {
-    const path = `./${url.toString()}.md`;
+  if (url && typeof url === 'string') {
+    const { pathname } = new URL(url);
+    const path = `.${pathname}.md`;
 
     const text = await Deno.readTextFile(path);
     const metaData = decodeMdMetadata(text);
@@ -146,19 +147,15 @@ async function micropubDeletePost(request: Request): Promise<Response> {
   throw new HttpError(400, 'No URL entry');
 }
 
-async function uploadImage (image: File, postId: string) {
-  const fileExtention = mimeToExt[image.type];
+async function uploadImage (image: File, prefix?: string) {
+  const fileSavePath = `/img/${prefix ? `${prefix}-` : ''}${image.name}`;
+  const arrBuff = await image.arrayBuffer();
 
-  if (fileExtention) {
-    const fileSavePath = `/img/${postId}.${fileExtention}`;
-    const arrBuff = await image.arrayBuffer();
+  await fs.ensureDir(`./img`);
+  await Deno.create(`./${fileSavePath}`);
+  await Deno.writeFile(`.${fileSavePath}`, new Uint8Array(arrBuff));
 
-    await fs.ensureDir(`./img`);
-    await Deno.create(`./${fileSavePath}`);
-    await Deno.writeFile(`.${fileSavePath}`, new Uint8Array(arrBuff));
-
-    return fileSavePath;
-  }
+  return fileSavePath;
 }
 
 async function micropubCreatePost(request: Request): Promise<Response> {
@@ -208,25 +205,84 @@ async function micropubCreatePost(request: Request): Promise<Response> {
   return new Response(null, {
     status: 201,
     headers: new Headers({
-      'Location': `/h-${type}/${postId}`
+      'Location': `${new URL(request.url).origin}/h-${type}/${postId}`
     })
   });
+}
+
+async function micropubQuery(request: Request): Promise<Response> {
+  const requestURL = new URL(request.url);
+  const q = requestURL.searchParams.get('q');
+
+  if (q) {
+    if (q === 'config') {
+      return new Response(JSON.stringify({ 'media-endpoint': requestURL.origin + '/micropub/upload-media' }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json'
+        })
+      });
+    }
+
+    if (q === 'syndicate-to') {
+      return new Response(JSON.stringify({ 'syndicate-to': [] }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json'
+        })
+      });
+    }
+  }
+
+  throw new HttpError(404);
+}
+
+async function micropubMediaEndpoint (request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const formData = await request.formData();
+  const file = formData.get('file');
+
+  if (file && file instanceof File) {
+    const path = await uploadImage(file);
+
+    return new Response(null, {
+      status: 201,
+      headers: new Headers({
+        'Location': url.origin + path
+      })
+    });
+  }
+
+  throw new HttpError(400, 'Bad Request');
 }
 
 async function micropubHandler (request: Request): Promise<Response> {
   try {
     const accessToken = await findAccessToken(request.clone());
 
-    const formData = await request.clone().formData();
-    const action = formData.get('action');
-
-    if (action === 'delete') {
-      return micropubDeletePost(request.clone());
-    } else if (action === 'undelete') {
-      return micropubUndeletePost(request.clone());
-    } else if (!action) {
-      return micropubCreatePost(request.clone());
+    if (request.method === 'GET' && new URL(request.url).searchParams.has('q')) {
+      return micropubQuery(request);
     }
+
+    if (request.method === 'POST') {
+      const pathname = new URL(request.url).pathname;
+
+      if (pathname === '/micropub/upload-media') {
+        return micropubMediaEndpoint(request);
+      }
+
+      const formData = await request.clone().formData();
+      const action = formData.get('action');
+
+      if (action === 'delete') {
+        return micropubDeletePost(request.clone());
+      } else if (action === 'undelete') {
+        return micropubUndeletePost(request.clone());
+      } else if (!action) {
+        return micropubCreatePost(request.clone());
+      }
+    }
+
 
     return new Response(accessToken, {
       status: 202,
@@ -235,13 +291,14 @@ async function micropubHandler (request: Request): Promise<Response> {
       }
     });
   } catch (e) {
+    console.error(e);
+
     if (e instanceof HttpError) {
       return new Response(e.message, {
-        status: e.status
+        status: e.status,
+        statusText: e.message
       });
     } else {
-      console.error(e);
-
       return new Response(null, {
         status: 500
       });
@@ -249,16 +306,29 @@ async function micropubHandler (request: Request): Promise<Response> {
   }
 }
 
-function handler (request: Request): Promise<Response> | Response  {
+Deno.run({
+  cmd: [
+    "deno",
+    "run",
+    "--allow-read",
+    "--allow-net",
+    "https://deno.land/std@0.133.0/http/file_server.ts",
+    "_site",
+  ]
+});
+
+async function handler (request: Request): Promise<Response>  {
   const url = new URL(request.url);
 
-  if (url.pathname === '/micropub') {
-    return micropubHandler(request);
+  if (url.pathname.includes('/micropub')) {
+    const response = await micropubHandler(request);
+
+    lumeCiMain([]);
+
+    return response;
   }
 
-  return new Response('', {
-    status: 404
-  });
+  return fetch('http://localhost:4507' + url.pathname);
 }
 
 console.log('Running on http://localhost:' + port);

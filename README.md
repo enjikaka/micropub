@@ -22,7 +22,5 @@ Undeleting a post will edit the markdown metadata to `draft: false`
 
 ## Todo
 
-- Add static server to `public/` folder.
 - Support query and updates in micropub api
-- Run Lume generation on changes
 - Support JSON requests
