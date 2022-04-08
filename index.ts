@@ -1,4 +1,6 @@
-import { http, fs } from './deps.ts';
+import { http, fs, streams, mime } from './deps.ts';
+import { decodeMdMetadata, encodeMdMetadata } from "./frontmatter.ts";
+import { formDataToJSON } from "./helpers.ts";
 
 const envPort = Deno.env.get('PORT');
 const port = envPort ? parseInt(envPort, 10) : 8080;
@@ -29,8 +31,7 @@ async function findAccessToken (request: Request): Promise<string> {
   const contentType = request.headers.get('Content-Type');
 
   if (
-    (contentType === 'application/x-www-form-urlencoded' ||
-    contentType === 'multipart/form-data') && request.body !== null
+    (contentType?.includes('application/x-www-form-urlencoded') || contentType?.includes('multipart/form-data')) && request.body !== null
   ) {
     const formData = await request.formData();
     const accessToken = formData.get('access_token');
@@ -39,8 +40,6 @@ async function findAccessToken (request: Request): Promise<string> {
       accessTokenFromBody = accessToken.toString();
     }
   }
-
-  console.log({ accessTokenFromBody, accessTokenFromHeader });
 
   if (accessTokenFromBody && accessTokenFromHeader) {
     throw new HttpError(400, 'Access token not allowed in both header and body at the same time');
@@ -64,152 +63,167 @@ async function checksum (data: string) {
   return hashHex;
 }
 
-function decodeMdMetadata (text: string): Record<string, any> {
-  const metaDataBlock = text.split('---')[1].split('---')[0];
-  const nonEmptyLines = metaDataBlock.split('\n').filter(Boolean);
-  const metaData = nonEmptyLines.reduce((acc, curr) => {
-    const [key, val] = curr.split(': ');
+async function setDraft (url: string, draft: boolean) {
+  const { pathname } = new URL(url);
+  const path = `.${pathname}.md`;
 
-    acc[key] = val;
-
-    return acc;
-  }, {} as Record<string, any>);
+  const text = await Deno.readTextFile(path);
+  const metaData = decodeMdMetadata(text);
 
   console.log(metaData);
 
-  return metaData;
-}
+  metaData.draft = draft;
 
-function encodeMdMetadata (metadata: Record<string, any>): string {
-  const lines = ['---'];
+  const newMetaData = encodeMdMetadata(metaData);
 
-  for (const [key, val] of Object.entries(metadata)) {
-    lines.push(`${key}: ${Array.isArray(val) ? JSON.stringify(val) : val}`);
-  }
+  const newText = newMetaData + text.split('---')[2];
 
-  lines.push('---');
+  await Deno.writeTextFile(path, newText);
 
-  return lines.join('\n');
+  return new Response(null, {
+    status: 204
+  });
 }
 
 async function micropubUndeletePost(request: Request): Promise<Response> {
-  const formData = await request.formData();
-  const url = formData.get('url');
+  const url = await getValueFromBody('url', request);
 
-  if (url && typeof url === 'string') {
-    const { pathname } = new URL(url);
-    const path = `.${pathname}.md`;
-
-    const text = await Deno.readTextFile(path);
-    const metaData = decodeMdMetadata(text);
-
-    metaData.draft = false;
-
-    const newMetaData = encodeMdMetadata(metaData);
-
-    const newText = newMetaData + text.split('---')[2];
-
-    await Deno.writeTextFile(path, newText);
-
-    return new Response(null, {
-      status: 204
-    });
+  if (url) {
+    return setDraft(url, false);
   }
 
   throw new HttpError(400, 'No URL entry');
 }
 
 async function micropubDeletePost(request: Request): Promise<Response> {
-  const formData = await request.formData();
-  const url = formData.get('url');
+  const url = await getValueFromBody('url', request);
 
-  if (url && typeof url === 'string') {
-    const { pathname } = new URL(url);
-    const path = `.${pathname}.md`;
-
-    const text = await Deno.readTextFile(path);
-    const metaData = decodeMdMetadata(text);
-
-    metaData.draft = true;
-
-    const newMetaData = encodeMdMetadata(metaData);
-
-    const newText = newMetaData + text.split('---')[2];
-
-    await Deno.writeTextFile(path, newText);
-
-    return new Response(null, {
-      status: 204
-    });
+  if (url) {
+    return setDraft(url, true);
   }
 
   throw new HttpError(400, 'No URL entry');
 }
 
-async function uploadImage (image: File, prefix?: string) {
-  const fileSavePath = `/img/${prefix ? `${prefix}-` : ''}${image.name}`;
-  const arrBuff = await image.arrayBuffer();
+async function uploadImage (image: mime.FormFile, prefix?: string) {
+  console.log('uploadImage', image);
+
+  if (!image.content) return;
+
+  const fileSavePath = `/img/${prefix ? `${prefix}-` : ''}${image.filename}`;
 
   await fs.ensureDir(`./img`);
-  await Deno.create(`./${fileSavePath}`);
-  await Deno.writeFile(`.${fileSavePath}`, new Uint8Array(arrBuff));
+  const file = await Deno.open(`./${fileSavePath}`, { write: true, create: true });
+  await streams.writeAll(file, image.content);
 
   return fileSavePath;
 }
 
-async function micropubCreatePost(request: Request): Promise<Response> {
-  const formData = await request.formData();
-  const postContentHash = await checksum(formData.get('content')?.toString() ?? '');
-  const timeHash = await checksum(Date.now() + '');
+export interface JSONCreateRequest {
+  type: string,
+  properties: {
+    content: string[],
+    photo?: Array<{ value: string, alt: string }>,
+  } & Record<string, string[]>
+};
+
+/**
+ * Adds date and postId to properties
+ */
+async function addCustomProperties (cr: JSONCreateRequest): Promise<JSONCreateRequest> {
   const dateString = new Date().toISOString().split('T')[0];
+  const timeHash = await checksum(Date.now() + '');
+  const postContentHash = await checksum(cr.properties.content[0]);
   const postId = `${dateString}-${postContentHash.substring(0, 3)}${timeHash.substring(0, 3)}`;
-  const metadata: Record<string, any> = {
-    date: dateString
-  };
-  const type = formData.get('h')?.toString() || 'entry';
 
-  for (const [key, val] of formData.entries()) {
-    const disallowedKeys = ['content'];
+  cr.properties.date = [dateString];
+  cr.properties.postId = [postId];
 
-    if (!disallowedKeys.includes(key)) {
-      if (key.includes('[')) {
-        const cleanKey = key.split('[')[0];
+  return cr;
+}
 
-        if (Array.isArray(metadata[cleanKey])) {
-          metadata[cleanKey].push(val);
-        } else {
-          metadata[cleanKey] = [val];
+function parseContent(contentArray: Array<string | { html: string }>) {
+  return contentArray.map(x => typeof x === 'string' ? x : x.html).join('<br>');
+}
+
+async function micropubCreatePost(request: Request): Promise<Response> {
+  let createRequest: JSONCreateRequest | undefined;
+
+  if (
+    request.headers.get('content-type')?.includes('application/x-www-form-urlencoded') ||
+    request.headers.get('content-type')?.includes('multipart/form-data')
+  ) {
+    const formData = await request.clone().formData();
+    let _createRequest = await formDataToJSON(formData);
+
+    _createRequest = await addCustomProperties(_createRequest);
+
+    let photos: Array<mime.FormFile> | undefined;
+
+    console.log(formData);
+
+    if ((formData.has('photo') || formData.has('photo[]')) && request.headers.get('content-type')?.includes('multipart/form-data')) {
+      photos = [];
+
+      if (request.body) {
+        const r = streams.readerFromStreamReader(request.body.getReader());
+        const mr = new mime.MultipartReader(r, request.headers.get('content-type')?.split('boundary=')[1] ?? '');
+
+        const mpFormData = await mr.readForm();
+
+        for (const [key, val] of mpFormData.entries()) {
+          if (val) {
+            for (const v of val) {
+              if ((key === 'photo' || key === 'photo[]') && mime.isFormFile(v)) {
+                photos.push(v);
+              }
+            }
+          }
         }
-      } else {
-        metadata[key] = val;
       }
     }
-  }
 
-  if (metadata.photo) {
-    let newValue;
+    if (photos && _createRequest) {
+      const uploadedPhotos = await Promise.all(
+        photos.map(async p => {
+          const value = await uploadImage(p, _createRequest.properties.postId[0]);
 
-    if (Array.isArray(metadata.photo)) {
-      newValue = await Promise.all(metadata.photo.map((photo, i) => uploadImage(photo, `${postId}-${i+1}`)))
-    } else {
-      newValue = await uploadImage(metadata.photo, postId + '-1');
+          return value ? { value, alt: '' } : undefined;
+        })
+      );
+
+      _createRequest.properties.photo = uploadedPhotos.filter(Boolean) as Array<{
+        value: string;
+        alt: string;
+      }>;
     }
 
-    metadata.photo = newValue;
+    createRequest = _createRequest;
   }
 
-  const fileContents = [encodeMdMetadata(metadata), formData.get('content')].join('\n\n');
+  if (request.headers.get('content-type')?.includes('application/json')) {
+    const _createRequest = await request.json();
 
-  await fs.ensureDir(`./h-${type}`);
-  await Deno.create(`./h-${type}/${postId}.md`);
-  await Deno.writeTextFile(`./h-${type}/${postId}.md`, fileContents);
+    createRequest = await addCustomProperties(_createRequest);
+  }
 
-  return new Response(null, {
-    status: 201,
-    headers: new Headers({
-      'Location': `${new URL(request.url).origin}/h-${type}/${postId}`
-    })
-  });
+  if (createRequest) {
+    const { type, properties } = createRequest;
+    const fileContents = [encodeMdMetadata(createRequest.properties), parseContent(createRequest.properties.content)].join('\n\n');
+
+    await fs.ensureDir(`./${type}`);
+    await Deno.create(`./${type}/${properties.postId[0]}.md`);
+    await Deno.writeTextFile(`./${type}/${properties.postId[0]}.md`, fileContents);
+
+    return new Response(null, {
+      status: 201,
+      headers: new Headers({
+        'Location': `${new URL(request.url).origin}/${type}/${properties.postId[0]}`
+      })
+    });
+  }
+
+  return new Response(null, { status: 500 });
 }
 
 async function micropubQuery(request: Request): Promise<Response> {
@@ -241,21 +255,71 @@ async function micropubQuery(request: Request): Promise<Response> {
 
 async function micropubMediaEndpoint (request: Request): Promise<Response> {
   const url = new URL(request.url);
-  const formData = await request.formData();
-  const file = formData.get('file');
 
-  if (file && file instanceof File) {
-    const path = await uploadImage(file);
+  if (request.headers.get('content-type')?.includes('multipart/form-data')) {
+    if (request.body) {
+      let path;
+      const r = streams.readerFromStreamReader(request.body.getReader());
+      const mr = new mime.MultipartReader(r, request.headers.get('content-type')?.split('boundary=')[1] ?? '');
 
-    return new Response(null, {
-      status: 201,
-      headers: new Headers({
-        'Location': url.origin + path
-      })
-    });
+      const mpFormData = await mr.readForm();
+
+      for (const [key, val] of mpFormData.entries()) {
+        console.log([key, val]);
+        if (val) {
+          for (const v of val) {
+            if (key === 'file' && mime.isFormFile(v)) {
+              path = await uploadImage(v);
+            }
+          }
+        }
+      }
+
+      if (path) {
+        return new Response(null, {
+          status: 201,
+          headers: new Headers({
+            'Location': url.origin + path
+          })
+        });
+      }
+    }
   }
 
   throw new HttpError(400, 'Bad Request');
+}
+
+async function getValueFromBody (key: string, request: Request): Promise<string | undefined> {
+  let value;
+
+  if (request.headers.get('content-type')?.includes('application/x-www-form-urlencoded') || request.headers.get('content-type')?.includes('multipart/form-data')) {
+    console.log('reading form data...');
+    const formData = await request.clone().formData();
+    console.log('reading form data... done.', formData);
+
+    value = formData.get(key)?.toString();
+  }
+
+  if (request.headers.get('content-type')?.includes('application/json')) {
+    const json = await request.clone().json();
+
+    value = json[key];
+  }
+
+  return value;
+}
+
+async function getAction (request: Request): Promise<'delete' | 'undelete' | 'create'> {
+  const action = await getValueFromBody('action', request);
+
+  switch (action) {
+    case 'delete':
+      return 'delete';
+    case 'undelete':
+        return 'undelete';
+    default:
+      return 'create';
+  }
 }
 
 async function micropubHandler (request: Request): Promise<Response> {
@@ -273,14 +337,17 @@ async function micropubHandler (request: Request): Promise<Response> {
         return micropubMediaEndpoint(request);
       }
 
-      const formData = await request.clone().formData();
-      const action = formData.get('action');
+      console.log(request);
+
+      const action = await getAction(request);
+
+      console.log(action);
 
       if (action === 'delete') {
         return micropubDeletePost(request.clone());
       } else if (action === 'undelete') {
         return micropubUndeletePost(request.clone());
-      } else if (!action) {
+      } else if (action === 'create') {
         return micropubCreatePost(request.clone());
       }
     }
@@ -293,7 +360,7 @@ async function micropubHandler (request: Request): Promise<Response> {
       }
     });
   } catch (e) {
-    console.error(e);
+    console.log(e);
 
     if (e instanceof HttpError) {
       return new Response(e.message, {
@@ -338,7 +405,10 @@ runLume();
 async function handler (request: Request): Promise<Response>  {
   const url = new URL(request.url);
 
-  if (url.pathname.includes('/micropub')) {
+  if (
+    url.pathname === '/micropub' ||
+    url.pathname === '/micropub/upload-media'
+  ) {
     const response = await micropubHandler(request);
 
     runLume();
