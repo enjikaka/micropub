@@ -23,4 +23,3 @@ Undeleting a post will edit the markdown metadata to `draft: false`
 ## Todo
 
 - Support query and updates in micropub api
-- Support JSON requests
