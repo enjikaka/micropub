@@ -138,6 +138,7 @@ async function addCustomProperties (cr: JSONCreateRequest): Promise<JSONCreateRe
 
   cr.properties.date = [dateString];
   cr.properties.postId = [postId];
+  cr.properties.h = [cr.type[0].split('h-')[1]];
 
   return cr;
 }
@@ -159,8 +160,6 @@ async function micropubCreatePost(request: Request): Promise<Response> {
     _createRequest = await addCustomProperties(_createRequest);
 
     let photos: Array<mime.FormFile> | undefined;
-
-    console.log(formData);
 
     if ((formData.has('photo') || formData.has('photo[]')) && request.headers.get('content-type')?.includes('multipart/form-data')) {
       photos = [];
@@ -247,6 +246,38 @@ async function micropubQuery(request: Request): Promise<Response> {
           'Content-Type': 'application/json'
         })
       });
+    }
+
+    if (q === 'source') {
+      const url = requestURL.searchParams.get('url');
+      const requestedProps = requestURL.searchParams.getAll('properties[]');
+
+      if (url) {
+        const { pathname } = new URL(url);
+        const path = `.${pathname}.md`;
+
+        const text = await Deno.readTextFile(path);
+        const metaData = decodeMdMetadata(text);
+        const [,, content] = text.split('---');
+
+        const properties: Record<string, string[]> = {
+          ...metaData,
+          content: [content.trim()]
+        };
+
+        return new Response(JSON.stringify({
+          type: 'h-' + metaData.h,
+          properties: requestedProps ? requestedProps.reduce((acc, curr) => ({
+            ...acc,
+            [curr]: properties[curr],
+          }), {}) : properties
+        }), {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'application/json'
+          })
+        });
+      }
     }
   }
 
